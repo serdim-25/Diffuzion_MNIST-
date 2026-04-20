@@ -1,0 +1,340 @@
+import torch
+from torchvision import datasets, transforms
+import torch.nn as nn
+import math
+import torch.optim as optim 
+import matplotlib.pyplot as plt
+
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+train_dataset = datasets.MNIST(root='./data_mn', train=True, download=True, transform=transform)
+test_dataset = datasets.MNIST(root='./data_mn', train=False, download=True, transform=transform)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=128, shuffle=False)
+
+
+def noise_schedule(T=1000):
+    beta = torch.linspace(1e-4, 0.02, T)
+    alpha = 1 - beta 
+    alpha_cumprod = torch.cumprod(alpha, dim=0)
+    alpha_cumprod_prev = torch.cat([torch.tensor([1.0]), alpha_cumprod[:-1]])
+        
+    sqrt_alpha_cumprod = torch.sqrt(alpha_cumprod)
+    sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - alpha_cumprod)
+
+    posterior_variance = beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
+    sqrt_recip_alpha = torch.sqrt(1.0 / alpha)             
+    sqrt_recip_m1 = torch.sqrt(1.0 / alpha - 1) 
+    
+    result_dict = {
+        'beta': beta,
+        'alpha': alpha,
+        'alpha_cumprod': alpha_cumprod,
+        'alpha_cumprod_prev': alpha_cumprod_prev,
+        'sqrt_alpha_cumprod': sqrt_alpha_cumprod,
+        'sqrt_one_minus_alpha_cumprod': sqrt_one_minus_alpha_cumprod,
+        'posterior_variance': posterior_variance,
+        'sqrt_recip_alpha': sqrt_recip_alpha,
+        'sqrt_recip_m1': sqrt_recip_m1,
+    }
+    return result_dict
+
+
+noise_params = noise_schedule(T=1000)
+
+def q_sample(x_0, noise, t, schedule=noise_params):
+    sqrt_alpha_cumprod = schedule['sqrt_alpha_cumprod'][t]
+    sqrt_one_minus_alpha_cumprod = schedule['sqrt_one_minus_alpha_cumprod'][t]
+    
+    sqrt_alpha_cumprod = sqrt_alpha_cumprod[:, None, None, None]
+    sqrt_one_minus_alpha_cumprod = sqrt_one_minus_alpha_cumprod[:, None, None, None]
+    
+    return sqrt_alpha_cumprod * x_0 + sqrt_one_minus_alpha_cumprod * noise
+
+def p_sample(x, t, predicted_noise, schedule=noise_params):
+    beta = schedule['beta'][t][:, None, None, None]
+    sqrt_recip_alpha = schedule['sqrt_recip_alpha'][t][:, None, None, None]
+    sqrt_recip_m1 = schedule['sqrt_recip_m1'][t][:, None, None, None]
+    
+    x_prev = sqrt_recip_alpha * (x - beta * predicted_noise / sqrt_recip_m1)
+    
+    if t[0] > 0:
+        posterior_variance = schedule['posterior_variance'][t][:, None, None, None]
+        x_prev = x_prev + torch.sqrt(posterior_variance) * torch.randn_like(x_prev)
+    
+    return x_prev
+
+def sinusoidal_embedding(t, embedding_dim=28): # батч значений Т сами значения 
+    batch_size = t.shape[0]
+    half_dim = embedding_dim  // 2     
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(0, half_dim, dtype=torch.float32) / half_dim) 
+    angles = t.unsqueeze(1).float() * freqs.unsqueeze(0)   
+    embeddings = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+    return embeddings
+
+def emd(num_class, H, W, num_classes=10):
+    batch_size = num_class.shape[0]
+    device = num_class.device
+
+    one_hot = torch.zeros(batch_size, num_classes, device=device)
+    one_hot.scatter_(1, num_class.unsqueeze(1), 1)
+
+    tensor_zeros = one_hot[:, :, None, None].expand(-1, -1, H, W)
+    
+    return tensor_zeros
+
+class ResidualBlock(nn.Module):
+    def __init__(self, num_channels, time_embedding, num_classes=10): 
+        super().__init__()
+        self.num_channels = num_channels
+        self.time_embedding = time_embedding
+        self.num_classes = num_classes
+        
+        self.main1 = nn.Sequential(
+            nn.BatchNorm2d(num_channels + num_classes), 
+            nn.Conv2d(num_channels + num_classes, num_channels, kernel_size=3, padding='same'),
+            nn.SiLU(inplace=True))
+        
+        self.main2 = nn.Sequential(  
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding='same'),
+            nn.SiLU(inplace=True)
+        )
+        
+        self.residu = nn.Sequential(
+            nn.BatchNorm2d(num_channels + num_classes), 
+            nn.Conv2d(num_channels + num_classes, num_channels, kernel_size=3, padding='same'), 
+            nn.SiLU(inplace=True)
+        )
+        
+        self.time = nn.Linear(time_embedding, num_channels) 
+
+    def forward(self, x, t, label): 
+        batch_size, channels, H, W = x.shape
+
+        t_emb = sinusoidal_embedding(t, self.time_embedding)
+        t_proj = self.time(t_emb)[:, :, None, None]
+        label_map = emd(label, H, W)  
+        
+      
+        x = torch.cat([x, label_map], dim=1) 
+        
+        h = self.residu(x)
+        x = self.main1(x)  
+        x += t_proj 
+        x = self.main2(x)    
+        
+        return x + h
+
+# x = torch.empty(size = (32 , 2 , 28 , 28 )) 
+# labels = torch.ones(32)
+# model = ResidualBlock(x.shape[1] , 8 )  
+# print(model(x,torch.ones(32),labels.long()).shape)
+
+
+class DownBlock(nn.Module):
+    def __init__(self , num_channels , time_embedding):
+        super().__init__()
+        self.num_channels = num_channels
+        self.time_embedding = time_embedding
+        self.residual1 = ResidualBlock(num_channels , time_embedding)
+        self.residual2 = ResidualBlock(num_channels , time_embedding)
+        self.pool = nn.AvgPool2d(kernel_size=2)
+        self.cnn = nn.Conv2d(num_channels , num_channels * 2 , kernel_size=3 , padding='same')
+
+    def forward(self , x , t , label): 
+        x = self.residual1(x, t , label)
+        residual_1 = x
+        
+        x = self.residual2(x, t , label)
+        residual_2 = x
+        
+        x = self.pool(x)  
+        return residual_1, residual_2, self.cnn(x)
+
+# labels = torch.ones(32).long()   
+# x = torch.empty(size = (32 , 2 , 28 , 28 )) 
+# model = DownBlock(x.shape[1] , 8 )  
+# print(model(x,torch.ones(32) , labels)[-1].shape)
+
+class UpBlock(nn.Module):
+    def __init__(self , num_channels , time_embedding , in_channels1 , in_channels2):
+        super().__init__()
+        self.num_channels = num_channels
+        self.time_embedding = time_embedding
+        self.in_channels1 = in_channels1
+        self.in_channels2 = in_channels2
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.residual1 = ResidualBlock(in_channels1  , time_embedding)
+        self.residual2 = ResidualBlock(in_channels2  , time_embedding)
+        self.cnn1 = nn.Conv2d(in_channels1 + in_channels2  , in_channels1 , kernel_size=3 , padding='same' , bias=False)
+        self.cnn2 = nn.Conv2d(in_channels2 + num_channels  , in_channels2 , kernel_size=3 , padding='same' , bias = False)
+        self.batch1 = nn.BatchNorm2d(in_channels1)
+        self.batch2 = nn.BatchNorm2d(in_channels2)
+
+    def forward(self , x , t , residual_1 , residual_2 , label): 
+        x = self.upsample(x)
+        
+        x = torch.cat([x , residual_2] , dim = 1)
+        x = self.cnn2(x)
+        x = self.batch2(x)
+        x = self.residual2(x , t , label)
+
+        x = torch.cat([x , residual_1] , dim = 1)
+        x = self.cnn1(x)
+        x = self.batch1(x)
+        x = self.residual1(x , t , label)
+        return x 
+    
+class Begin(nn.Module):
+    def __init__(self , num_channels , hidden_channels = 28 , out_channels = 56):
+        super().__init__()
+        self.num_channels = num_channels 
+        self.out_channels = out_channels
+        self.cnn1= nn.Conv2d(num_channels + 10 , hidden_channels , kernel_size=3 , padding='same' , bias=False)
+        self.batch1 = nn.BatchNorm2d(hidden_channels)
+        self.act1 = nn.SiLU(inplace=True)
+
+        self.cnn2 = nn.Conv2d(hidden_channels , out_channels , kernel_size=3 , padding='same' , bias = False)
+        self.batch2 = nn.BatchNorm2d(out_channels)
+        self.act2 = nn.SiLU(inplace=True)
+
+    def forward(self, x , t , label):
+        batch_size, channels, H, W = x.shape
+        t = sinusoidal_embedding(t , 28)[: , : , None , None]    
+        label_map = emd(label, H, W)  
+             
+        x = torch.cat([x, label_map], dim=1)     
+        x = self.cnn1(x)
+        x += t
+        x = self.batch1(x) 
+        x = self.act1(x)
+
+        x = self.cnn2(x)
+        x = self.batch2(x) 
+        x = self.act2(x)
+        return x 
+
+class U_net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.begin = Begin(1)
+        self.down1 = DownBlock(56 , 28)
+        self.down2 = DownBlock(112 , 28)
+        self.residual1 = ResidualBlock(224 , 28)
+        self.residual2 = ResidualBlock(224 , 28)
+        self.up1 = UpBlock(224 , 28 , 112 , 112)
+        self.up2 = UpBlock(112 , 28 , 56 , 56)
+        self.cnn1 = nn.Conv2d(66 , 33 , kernel_size=3 , padding='same' , bias=False)
+        self.cnn2 = nn.Conv2d(33 , 1 , kernel_size=3 , padding='same') 
+        self.act = nn.SiLU(inplace=True)
+        self.batch1 = nn.BatchNorm2d(33)
+    def forward(self , x , t , label): 
+        x = self.begin(x , t , label)
+        
+        residual_1_28, residual_2_28,  x = self.down1(x , t , label) # res[3, 28, 28, 28] , x[3, 56, 14, 14]
+        residual_1_14, residual_2_14,  x = self.down2(x , t , label) # res[3, 56, 14, 14] , x[3, 112, 7, 7]
+        
+        x = self.residual1(x , t , label)
+        x = self.residual2(x , t , label)
+        
+        x = self.up1(x , t , residual_1_14 , residual_2_14 , label)
+        x = self.up2(x , t , residual_1_28 , residual_2_28 , label)
+        
+        batch_size, channels, H, W = x.shape
+        label_map = emd(label, H, W)        
+        x = torch.cat([x, label_map], dim=1) 
+        x = self.cnn1(x)
+        x = self.batch1(x)
+        x = self.act(x)
+        
+        x = self.cnn2(x)
+        return x
+# labels = torch.ones(3).long()    
+# t = torch.tensor([100 , 1 , 8])
+# x = torch.empty(size = (3 , 1 , 28 , 28))
+# noise = torch.randn_like(x)
+# x = q_sample(x , noise , t)
+# model = U_net()
+# print(model(x , t ,labels).shape)
+
+def generate(model, num_images=1, labels=None):
+    model.eval()
+    x = torch.randn(num_images, 1, 28, 28)
+    
+    if labels is None:
+        labels = torch.randint(0, 10, (num_images,))
+    
+    T = 1000 
+    for t in reversed(range(T)):
+        t_tensor = torch.full((num_images,), t, dtype=torch.long)
+        pred_noise = model(x, t_tensor, labels)
+        x = p_sample(x, t_tensor, pred_noise)
+    
+    model.train()
+    return x, labels 
+
+
+model = U_net()
+opt = optim.Adam(params=model.parameters() , lr = 0.0001)
+ephos = 100
+losses = []
+T = 1000
+
+for e in range(ephos) : 
+    model.train()
+    mean_loss = 0
+    count = 0 
+    for x_train , y_train in train_loader : 
+        current_batch_size = x_train.shape[0]
+        t = torch.randint(0 , T ,(current_batch_size,))
+        noise = torch.randn_like(x_train)
+        labels = y_train.long()
+
+        x_noise = q_sample(x_train , noise , t)
+        pred = model(x_noise , t , labels)
+
+        loss = nn.functional.mse_loss(pred, noise)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        mean_loss += loss.item()
+        count += 1 
+
+    mean_loss /= count
+    losses.append(mean_loss)
+    print(f'epoch {e+1} , loss {losses[-1]}')
+
+    if (e + 1) % 10 == 0: 
+        torch.save(model, f'diff_{e+1}.pth')
+        
+        with torch.no_grad():
+            fig, axes = plt.subplots(2, 5, figsize=(12, 6))
+            for i, class_num in enumerate(range(10)):
+                row = i // 5
+                col = i % 5
+                labels_gen = torch.tensor([class_num])
+                img, _ = generate(model, num_images=1, labels=labels_gen)
+                img = (img + 1) / 2
+                img = img.clamp(0, 1)
+                img_display = img.squeeze()
+                
+                axes[row, col].imshow(img_display, cmap='gray')
+                axes[row, col].set_title(f'Class {class_num}')
+                axes[row, col].axis('off')
+            
+            plt.suptitle(f'Generated Images (Epoch {e+1})')
+            plt.tight_layout()
+            plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.plot(losses, linewidth=2, color='blue')
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Loss', fontsize=12)
+plt.title('Training Loss Curve', fontsize=14)
+plt.grid(True, alpha=0.3)
+plt.show()
